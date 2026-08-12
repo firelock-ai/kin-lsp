@@ -1,14 +1,19 @@
 # kin-lsp
 
-> Language-server enrichment boundary that feeds type-resolved relations into the Kin graph.
+> Language-server integration boundary for the Kin graph.
 
-`kin-lsp` bridges standard language servers and the Kin semantic graph. Tree-sitter
-parsing gives Kin syntax-level structure; `kin-lsp` adds the type-resolved relations
-that require language-server knowledge: call edges from call hierarchy, override edges
-from type hierarchy, cross-file type-usage edges from go-to-type-definition, and
-reference edges from find-references. The resulting relations are consumed by `kin` and
-stored in `kin-db` as first-class graph edges with stable identity and provenance
-records.
+`kin-lsp` drives standard language servers and turns their answers into graph
+relations. Tree-sitter parsing gives Kin syntax-level structure. `kin-lsp` adds
+the type-resolved relations that only a language server can settle: call edges
+from call hierarchy, override edges from type hierarchy, cross-file type-usage
+edges from go-to-type-definition, and reference edges from find-references.
+
+It is the language-server integration boundary in the open Kin local substrate.
+`kin` depends directly on this standalone repo through the `kin` cargo registry,
+and merges the relations it returns into the graph, where `kin-db` stores them as
+first-class edges. Ranking, proof-weighting, and graph storage live above this
+crate, not inside it. Enrichment is an addon over Kin's own parsers and linkers,
+never a replacement for them.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Part of Kin](https://img.shields.io/badge/part%20of-Kin-6E56CF.svg)](https://github.com/firelock-ai/kin)
@@ -22,73 +27,97 @@ with Git and projects graph truth back to a normal filesystem, so any tool works
 
 Start at **[firelock-ai/kin](https://github.com/firelock-ai/kin)** · **[kinlab.ai](https://kinlab.ai)**
 
-## kin-lsp's role
-
-`kin-lsp` is an async Rust library crate. It spawns external language server processes
-over stdin/stdout JSON-RPC (the LSP wire protocol), performs the initialize handshake,
-drives targeted requests (`textDocument/definition`, `textDocument/references`,
-`textDocument/typeDefinition`, `callHierarchy/outgoingCalls`, `typeHierarchy/supertypes`),
-and translates the results into `kin-model` relation types that the Kin ingest pipeline
-commits to the graph.
-
-`kin` depends on this crate directly via the `kin` Cargo registry. No hosted or
-control-plane logic lives here; this crate belongs to the open local substrate.
-
-## Supported language-server adapters
-
-| Language | Server |
-|----------|--------|
-| Rust | `rust-analyzer` |
-| C / C++ | `clangd` (needs `compile_commands.json`) |
-| Go | `gopls` |
-| Java | `jdtls` (Eclipse JDT Language Server) |
-| Python | `pyright-langserver` |
-| TypeScript / JavaScript | `typescript-language-server` |
-
-The adapter for each language is a small `LspAdapter` impl in `src/adapters/`. The
-`which` crate gates adapter availability at runtime: if the server binary is not on
-`PATH`, that language is silently skipped during enrichment.
-
 ## Build
 
 ```bash
-cargo build --release
+cargo build
 cargo test
 ```
 
-There are no compile-time feature flags. Language-server availability is a runtime
-concern, not a build-time one.
+There are no compile-time feature flags. Which language servers are usable is a
+runtime question, not a build-time one, so the crate compiles the same way on a
+machine with no servers installed.
+
+The integration tests under `tests/` drive a real `rust-analyzer` against a
+sibling `kin` checkout. Each one prints `SKIP` and passes when the binary or the
+checkout is missing, so a plain `cargo test` stays green on a bare machine.
+Install the server with `rustup component add rust-analyzer` to exercise them for
+real.
+
+## Providers
+
+`ProviderRegistry::with_defaults()` seeds the languages Kin knows how to drive.
+Binary names are searched on `PATH` in preference order, and the first one found
+wins.
+
+| Language | Providers, in preference order |
+|----------|--------------------------------|
+| Rust | `rust-analyzer` |
+| Python | `pyright` (`pyright-langserver`), then `pylsp` |
+| TypeScript | `typescript-language-server`, then `vtsls` |
+| JavaScript | `typescript-language-server` |
+| Go | `gopls` |
+| Java | `jdtls` (Eclipse JDT Language Server) |
+| C and C++ | `clangd`, which wants a `compile_commands.json` to index against |
+
+Every provider declares the capabilities Kin expects of it, and the live
+`initialize` handshake decides what it actually serves. The gap between the two
+is recorded rather than assumed. `LspCapability::CITABLE_MINIMUM` is the floor:
+without go-to-definition and find-references a pass produces effectively nothing,
+so a required server below that floor fails loud instead of running degraded.
+
+A language with no server on `PATH` is not skipped quietly. The registry returns
+a `ProviderGap` naming the language, the reason, and every provider it tried, so
+a run that enriched less than it should says so.
+
+Per-server launch details live beside the registry in `src/adapters/`, one small
+`LspAdapter` impl each: the file extensions it claims, the initialization options
+it sends, and whether it needs a workspace index before answers are trustworthy.
 
 ## How it feeds the graph
 
-During `kin ingest` (or triggered by the daemon on file change), `kin` calls into
-`kin-lsp` to enrich a set of source files:
+During ingest, or when the `kin` daemon reacts to a changed file, `kin` calls
+into `kin-lsp` to enrich a set of source files.
 
-1. `kin-lsp` discovers the applicable language server for each file via `src/discovery.rs`.
-2. For each server, it spawns the process (`src/lifecycle.rs`), performs the LSP
-   `initialize` handshake, and drives the enrichment loop (`src/enrichment.rs`).
-3. Resolved relations (call, override, type-usage, and reference edges) are returned as
-   `EnrichmentResult` values using `kin-model` types.
-4. `kin` merges these into the graph via `kin-db`, where they become permanent graph
-   edges with content hashes and provenance records.
+1. `discovery.rs` and `registry.rs` resolve the provider for each language.
+2. `lifecycle.rs` spawns the server and runs the LSP `initialize` handshake.
+   `enrichment.rs` drives `prepareCallHierarchy` with
+   `callHierarchy/outgoingCalls`, `prepareTypeHierarchy` with
+   `typeHierarchy/supertypes`, `textDocument/typeDefinition`, and
+   `textDocument/references`. `file_enrichment.rs` drives the per-file
+   `textDocument/definition` pass.
+3. Results come back as an `EnrichmentResult` built from `kin-model` types. The
+   relations are `Calls`, `Overrides`, `UsesType`, and `References`, each tagged
+   `RelationOrigin::Lsp` so it is always distinguishable from a tree-sitter or
+   linker-derived edge. `stamp_lsp_provenance` attaches the finer record of
+   provider, version, and capability; the caller applies it, because only the
+   caller knows which server it just drove.
+4. `kin` merges the relations into the graph through `kin-db`, where they become
+   edges with content hashes and provenance.
 
-Results are cached per file hash (`src/cache.rs`) so unchanged files skip re-enrichment.
+`cache.rs` keeps an in-memory cache keyed by file content hash, so a file that
+did not change skips re-enrichment within a session. Servers are started for an
+enrichment pass and shut down cleanly with `shutdown` and `exit`. The crate holds
+no long-lived background processes of its own; the `kin` daemon owns the
+enrichment schedule and calls in when it wants work done.
 
-## Daemon lifecycle
+## Key types
 
-`kin-lsp` manages language server processes per enrichment session. Each server is
-started fresh, used for the enrichment pass, and shut down cleanly (`shutdown` +
-`exit` notifications). The crate does not hold long-lived background processes; the
-`kin` daemon controls the enrichment schedule and calls into `kin-lsp` as needed.
-
-## Ecosystem
-
-| Repo | Role |
-|------|------|
-| [kin](https://github.com/firelock-ai/kin) | Semantic system of record, consumes this crate |
-| [kin-db](https://github.com/firelock-ai/kin-db) | Semantic engine, stores the enriched relations |
-| [kin-model](https://github.com/firelock-ai/kin-model) | Canonical types consumed and produced here |
-| [kinlab](https://kinlab.ai) | Hosted collaboration and control plane |
+- `EnrichmentResult`, `EntityRef`, `EntityIndex`: what a pass returns, and the
+  index it matches LSP locations against to find graph entities.
+- `ProviderRegistry`, `ResolvedProvider`, `ProviderProbe`: the provider model,
+  from static defaults through a binary found on `PATH` to a live server and the
+  capabilities it reported.
+- `ProviderGap`, `ProviderGapReason`: why a language produced nothing.
+- `LspCapability`: the five LSP requests enrichment consumes, plus the citable
+  minimum a required server has to meet.
+- `LspProvenance`, `stamp_lsp_provenance`: the provider, version, and capability
+  record carried by an LSP-derived relation.
+- `LspEnrichmentProof`, `ProofRecorder`, `ProofMode`, `ProofViolation`: the
+  per-run record of which servers ran, at which versions, and what they produced.
+- `RegistryConfig`: per-repo settings for which provider serves a language, which
+  languages are required, and which are disabled.
+- `LspError`, `Result`: typed errors.
 
 ## License
 
