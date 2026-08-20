@@ -89,6 +89,7 @@ pub async fn enrich_file_definitions(
     file_content: &str,
     entity_index: &EntityIndex,
     workspace_root: &Path,
+    documents: Option<crate::enrichment::DocumentProvider<'_>>,
 ) -> Result<FileEnrichmentResult> {
     let uri = protocol::path_to_uri(file_path);
     let rel_path = file_path
@@ -102,6 +103,7 @@ pub async fn enrich_file_definitions(
     let mut relations = Vec::new();
     let mut definitions_resolved = 0usize;
     let mut positions_queried = 0usize;
+    let mut scoped_documents = crate::enrichment::ScopedDocuments::new(server, documents);
 
     // Scan each line for identifier positions.
     for (line_num, line_text) in file_content.lines().enumerate() {
@@ -119,6 +121,106 @@ pub async fn enrich_file_definitions(
         };
 
         for col in positions {
+            // A member expression on a MODULE receiver is answered by its
+            // member. Asked at the receiver, the server returns the module, and
+            // `find_at` turns that into whichever entity holds the line, so
+            // every file that names `express` was recorded as referencing
+            // express's default export: 50 inbound edges on `createApplication`
+            // against 32 real reference sites on `Router`, which had none.
+            //
+            // Value receivers keep their edges. `res` in `res.send(...)`
+            // resolves to its own parameter in this file and says something
+            // true about the enclosing function. The two are told apart by
+            // where the server puts the receiver's definition, which is the
+            // server answering rather than this code guessing.
+            if let Some((_receiver, member_col, member_name)) =
+                crate::enrichment::member_expression_at(line_text, col)
+            {
+                let receiver_definitions = crate::enrichment::locations_at(
+                    server,
+                    "textDocument/definition",
+                    &uri,
+                    line,
+                    col,
+                )
+                .await;
+                if crate::enrichment::receiver_names_a_module(&receiver_definitions, &rel_path) {
+                    // Declining alone was not enough, and assuming otherwise is
+                    // what left a named export unreferenced. This pass used to
+                    // drop the receiver here reasoning that "the member's own
+                    // position is queried by this same loop on its next turn".
+                    // It is queried, and on express it answers
+                    // `node_modules/router`, outside the ingested tree, so
+                    // `find_at` finds nothing and no edge is minted. Removing
+                    // the wrong edge left nothing in its place, and the
+                    // reference surface reads this arm's `References` edges, so
+                    // `exports.Router` stayed at zero counted references against
+                    // 32 real call sites.
+                    //
+                    // The same equivalence join the UsesType arm uses supplies
+                    // the right edge: two independently proven server answers
+                    // naming the same place, never a name match.
+                    for candidate in crate::enrichment::member_export_bindings(
+                        server,
+                        entity_index,
+                        workspace_root,
+                        &mut scoped_documents,
+                        &rel_path,
+                        &uri,
+                        line,
+                        col,
+                        member_col,
+                        &member_name,
+                    )
+                    .await
+                    {
+                        if source.id == candidate.id
+                            || !seen.insert((source.id, candidate.id, "member_on_module"))
+                        {
+                            continue;
+                        }
+                        definitions_resolved += 1;
+                        relations.push(Relation {
+                            id: deterministic_relation_id(
+                                RelationKind::References,
+                                source.id,
+                                candidate.id,
+                            ),
+                            kind: RelationKind::References,
+                            src: GraphNodeId::Entity(source.id),
+                            dst: GraphNodeId::Entity(candidate.id),
+                            confidence: 0.85,
+                            origin: RelationOrigin::Lsp,
+                            created_in: None,
+                            import_source: None,
+                            evidence: crate::enrichment::query_position_evidence(
+                                "lsp_member_on_module",
+                                &rel_path,
+                                &protocol::Range {
+                                    start: protocol::Position {
+                                        line,
+                                        character: member_col,
+                                    },
+                                    end: protocol::Position {
+                                        line,
+                                        character: member_col,
+                                    },
+                                },
+                            ),
+                        });
+                        tracing::debug!(
+                            entity = %source.name,
+                            member = %member_name,
+                            references = %candidate.name,
+                            "bound a member on a module receiver to its export"
+                        );
+                    }
+                    // The receiver's own resolution is still not this entity's
+                    // fact, whether or not the member bound to anything.
+                    continue;
+                }
+            }
+
             let def_result = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
                 server.client.request(
@@ -214,6 +316,8 @@ pub async fn enrich_file_definitions(
             relations.extend(call_relations);
         }
     }
+
+    scoped_documents.close_all().await;
 
     Ok(FileEnrichmentResult {
         relations,
