@@ -412,6 +412,113 @@ pub async fn enrich_entity_overrides(
     Ok(relations)
 }
 
+/// The member expression an identifier position opens, when it opens one.
+///
+/// Returns the receiver text, the member's column, and the member's text for
+/// `express.Router` asked at `express`. Returns `None` for a bare identifier,
+/// for the member half of an expression (which is not itself a receiver), and
+/// for a dot followed by anything that is not an identifier.
+pub(crate) fn member_expression_at(line_text: &str, col: u32) -> Option<(String, u32, String)> {
+    let chars: Vec<char> = line_text.chars().collect();
+    let start = col as usize;
+    if start >= chars.len() {
+        return None;
+    }
+    // Both halves must START like an identifier rather than merely contain
+    // identifier characters, so `1.5` is a number and not a member expression.
+    // The caller only offers identifier starts today, but a predicate that
+    // depends on its caller's filtering is one refactor from being wrong.
+    if !(chars[start].is_alphabetic() || chars[start] == '_') {
+        return None;
+    }
+    let mut end = start;
+    while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+        end += 1;
+    }
+    if chars.get(end) != Some(&'.') {
+        return None;
+    }
+    let member_start = end + 1;
+    if !chars
+        .get(member_start)
+        .is_some_and(|ch| ch.is_alphabetic() || *ch == '_')
+    {
+        return None;
+    }
+    let mut member_end = member_start;
+    while member_end < chars.len()
+        && (chars[member_end].is_alphanumeric() || chars[member_end] == '_')
+    {
+        member_end += 1;
+    }
+    Some((
+        chars[start..end].iter().collect(),
+        member_start as u32,
+        chars[member_start..member_end].iter().collect(),
+    ))
+}
+
+/// One location answer for a request at a position, flattened out of the two
+/// shapes a server may reply with.
+async fn locations_at(
+    server: &LspServer,
+    method: &'static str,
+    uri: &str,
+    line: u32,
+    character: u32,
+) -> Vec<protocol::Location> {
+    let result = server
+        .client
+        .request(
+            method,
+            protocol::TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: uri.to_string(),
+                },
+                position: Position { line, character },
+            },
+        )
+        .await;
+    let Ok(value) = result else {
+        return Vec::new();
+    };
+    serde_json::from_value::<Vec<protocol::Location>>(value.clone()).unwrap_or_else(|_| {
+        serde_json::from_value::<protocol::Location>(value)
+            .map(|one| vec![one])
+            .unwrap_or_default()
+    })
+}
+
+/// Whether this receiver names a module rather than a value in this file.
+///
+/// Measured on express with typescript-language-server: `express` in
+/// `express.Router()` answers `definition` with `./index.js:10`, another file
+/// entirely, because the server follows the require through to the module it
+/// resolves. The value receivers on the same page stay home: `res` answers with
+/// its own parameter at `api_v1.js:6` and `apiv1` with its declaration at
+/// `api_v1.js:4`.
+///
+/// So the question "is this a module" is answered by where its definition
+/// lives, and it is the server answering rather than this code guessing. A
+/// receiver whose definition is a declaration in the file being enriched is a
+/// value in that file; one whose definition is another file's module entry is a
+/// reference to that module.
+fn receiver_names_a_module(definitions: &[protocol::Location], enriched_path: &str) -> bool {
+    definitions.iter().any(|location| {
+        protocol::uri_to_path(&location.uri)
+            .map(|path| {
+                let path = path.to_string_lossy().to_string();
+                !(path.ends_with(enriched_path) || enriched_path.ends_with(path.as_str()))
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Whether two answers name the same place.
+fn same_location(left: &protocol::Location, right: &protocol::Location) -> bool {
+    left.uri == right.uri && left.range.start.line == right.range.start.line
+}
+
 /// Query type definitions for entities referenced in a function's signature/body.
 /// For each resolved type, find it in the graph index and emit UsesType relations.
 pub async fn enrich_entity_uses_type(
@@ -447,6 +554,108 @@ pub async fn enrich_entity_uses_type(
         };
 
         for col in identifier_positions_in_line(line_text) {
+            // A member expression on a MODULE receiver is answered by its
+            // member, never by the receiver. `express.Router()` asked at
+            // `express` returns the module's own type, `lib/express.js:35`,
+            // which `find_at` reads as `createApplication`, so every file that
+            // so much as names `express` was recorded as using that one
+            // function: 50 inbound edges on express's default export and zero
+            // on `Router`, which has 32 real reference sites.
+            //
+            // Value receivers are untouched. `res` in `res.send(...)` genuinely
+            // tells the enclosing function it uses the Response type, and that
+            // edge is not this pass's mistake.
+            if let Some((_receiver, member_col, member_name)) = member_expression_at(line_text, col)
+            {
+                let receiver_definitions =
+                    locations_at(server, "textDocument/definition", &uri, line, col).await;
+                if receiver_names_a_module(&receiver_definitions, &entity.file_path) {
+                    let module_locations =
+                        locations_at(server, "textDocument/typeDefinition", &uri, line, col).await;
+                    let member_definitions =
+                        locations_at(server, "textDocument/definition", &uri, line, member_col)
+                            .await;
+                    for module_location in &module_locations {
+                        let Some(module_path) = protocol::uri_to_path(&module_location.uri) else {
+                            continue;
+                        };
+                        let module_path = module_path.to_string_lossy().to_string();
+                        for candidate in index.entities_in_file(&module_path) {
+                            if candidate.name != member_name {
+                                continue;
+                            }
+                            // The join, and the reason this is not the bare-name
+                            // fallback this pass deleted. The server proved
+                            // where the member resolves; it proves separately
+                            // where this export's own token resolves. Binding
+                            // requires those two answers to be the same place,
+                            // so a same-named export of something else does not
+                            // qualify: `exports.Route` resolves to
+                            // `router/lib/route.js`, a different target, and is
+                            // refused. Nothing is matched on the name alone.
+                            let candidate_uri =
+                                protocol::path_to_uri(&workspace_root.join(&candidate.file_path));
+                            let candidate_definitions = locations_at(
+                                server,
+                                "textDocument/definition",
+                                &candidate_uri,
+                                candidate.name_line,
+                                candidate.name_col,
+                            )
+                            .await;
+                            if !candidate_definitions.iter().any(|proven| {
+                                member_definitions
+                                    .iter()
+                                    .any(|member| same_location(proven, member))
+                            }) {
+                                continue;
+                            }
+                            if candidate.id == entity.id || !seen_targets.insert(candidate.id) {
+                                continue;
+                            }
+                            relations.push(Relation {
+                                id: deterministic_relation_id(
+                                    RelationKind::UsesType,
+                                    entity.id,
+                                    candidate.id,
+                                ),
+                                kind: RelationKind::UsesType,
+                                src: GraphNodeId::Entity(entity.id),
+                                dst: GraphNodeId::Entity(candidate.id),
+                                confidence: 0.85,
+                                origin: RelationOrigin::Lsp,
+                                created_in: None,
+                                import_source: None,
+                                evidence: query_position_evidence(
+                                    "lsp_member_on_module",
+                                    &entity.file_path,
+                                    &protocol::Range {
+                                        start: Position {
+                                            line,
+                                            character: member_col,
+                                        },
+                                        end: Position {
+                                            line,
+                                            character: member_col,
+                                        },
+                                    },
+                                ),
+                            });
+                            debug!(
+                                entity = %entity.name,
+                                member = %member_name,
+                                uses_type = %candidate.name,
+                                "bound a member on a module receiver to its export"
+                            );
+                        }
+                    }
+                    // The receiver's own type is not this entity's fact, whether
+                    // or not the member bound to anything. Declining here is
+                    // what makes the inflated attribution stop.
+                    continue;
+                }
+            }
+
             let type_def_result = server
                 .client
                 .request(
@@ -786,6 +995,91 @@ mod innermost_span_tests {
                 .find_at("file:///repo/src/requests/adapters.py", 6)
                 .map(|e| e.name.as_str()),
             Some("Outer.only")
+        );
+    }
+}
+
+#[cfg(test)]
+mod member_on_module_tests {
+    use super::{member_expression_at, receiver_names_a_module, same_location};
+    use crate::protocol::{Location, Position, Range};
+
+    fn location(uri: &str, line: u32) -> Location {
+        Location {
+            uri: uri.to_string(),
+            range: Range {
+                start: Position { line, character: 0 },
+                end: Position { line, character: 0 },
+            },
+        }
+    }
+
+    /// The express case: asked at the receiver, the member is what matters.
+    #[test]
+    fn a_receiver_reports_the_member_it_opens() {
+        let (receiver, col, member) =
+            member_expression_at("var apiv1 = express.Router();", 12).expect("a member expression");
+        assert_eq!(receiver, "express");
+        assert_eq!(member, "Router");
+        assert_eq!(col, 20);
+    }
+
+    /// Asked at the member half, there is no further member to bind, so the
+    /// position falls through to the ordinary type query rather than recursing.
+    #[test]
+    fn the_member_half_is_not_itself_a_receiver() {
+        assert!(member_expression_at("var apiv1 = express.Router();", 20).is_none());
+    }
+
+    /// A bare call has no receiver at all.
+    #[test]
+    fn a_bare_identifier_opens_nothing() {
+        assert!(member_expression_at("finalhandler(req, res);", 0).is_none());
+    }
+
+    /// A dot that opens no identifier is not a member expression, so a numeric
+    /// literal or a trailing dot cannot be read as one.
+    #[test]
+    fn a_dot_without_a_member_opens_nothing() {
+        assert!(member_expression_at("value.", 0).is_none());
+        assert!(member_expression_at("wait 1.5 seconds", 5).is_none());
+    }
+
+    /// The module-versus-value rule, as measured. `express` answers with
+    /// another file; `res` and `apiv1` answer with their own declarations in
+    /// the file being enriched.
+    #[test]
+    fn a_definition_in_another_file_names_a_module() {
+        assert!(receiver_names_a_module(
+            &[location("file:///w/index.js", 10)],
+            "examples/multi-router/controllers/api_v1.js"
+        ));
+    }
+
+    #[test]
+    fn a_definition_in_this_file_names_a_value() {
+        let here = "examples/multi-router/controllers/api_v1.js";
+        assert!(!receiver_names_a_module(
+            &[location(&format!("file:///w/{here}"), 6)],
+            here
+        ));
+        assert!(
+            !receiver_names_a_module(&[], here),
+            "a receiver the server said nothing about is not promoted to a module"
+        );
+    }
+
+    /// The join compares a place, not a name, which is what keeps this apart
+    /// from the bare-name fallback this pass deleted.
+    #[test]
+    fn the_join_compares_the_place_two_answers_name() {
+        let member = location("file:///w/node_modules/router/index.js", 51);
+        let router_export = location("file:///w/node_modules/router/index.js", 51);
+        let route_export = location("file:///w/node_modules/router/lib/route.js", 40);
+        assert!(same_location(&router_export, &member));
+        assert!(
+            !same_location(&route_export, &member),
+            "a same-shaped export of something else must not join"
         );
     }
 }
