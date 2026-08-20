@@ -460,7 +460,7 @@ pub(crate) fn member_expression_at(line_text: &str, col: u32) -> Option<(String,
 
 /// One location answer for a request at a position, flattened out of the two
 /// shapes a server may reply with.
-async fn locations_at(
+pub(crate) async fn locations_at(
     server: &LspServer,
     method: &'static str,
     uri: &str,
@@ -503,7 +503,10 @@ async fn locations_at(
 /// receiver whose definition is a declaration in the file being enriched is a
 /// value in that file; one whose definition is another file's module entry is a
 /// reference to that module.
-fn receiver_names_a_module(definitions: &[protocol::Location], enriched_path: &str) -> bool {
+pub(crate) fn receiver_names_a_module(
+    definitions: &[protocol::Location],
+    enriched_path: &str,
+) -> bool {
     definitions.iter().any(|location| {
         protocol::uri_to_path(&location.uri)
             .map(|path| {
