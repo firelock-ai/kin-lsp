@@ -522,13 +522,152 @@ fn same_location(left: &protocol::Location, right: &protocol::Location) -> bool 
     left.uri == right.uri && left.range.start.line == right.range.start.line
 }
 
+/// Graph-owned text for a repository-relative path, supplied by the caller.
+///
+/// The join below has to ask the server about a token in a file OTHER than the
+/// one being enriched, and a language server answers only about documents it
+/// has been handed. The daemon opens exactly the file it is enriching, so that
+/// second document does not exist as far as the server is concerned and every
+/// query against it comes back empty.
+///
+/// Reading the second file off disk here would answer the question and break
+/// the rule that matters more: after graph truth exists, a runtime query path
+/// does not get its answer from raw filesystem contents. So the content arrives
+/// from the caller, which holds repository authority: the daemon passes its
+/// graph/CAS source view, exactly the bytes it already opens the enriched file
+/// with. A caller that supplies no provider, or a provider that has nothing for
+/// a path, leaves the join declining precisely as it does today.
+pub type DocumentProvider<'a> = &'a (dyn Fn(&str) -> Option<String> + Send + Sync);
+
+/// The LSP language id for a path, by extension.
+///
+/// `None` means this code cannot name the language, and the caller declines
+/// rather than opening the document under a guess: a document opened as the
+/// wrong language answers nothing, which is indistinguishable at the call site
+/// from a document that was never opened, and only one of those is honest.
+fn lsp_language_id(path: &str) -> Option<&'static str> {
+    let extension = path.rsplit_once('.').map(|(_, ext)| ext)?;
+    Some(match extension {
+        "js" | "mjs" | "cjs" => "javascript",
+        "jsx" => "javascriptreact",
+        "ts" | "mts" | "cts" => "typescript",
+        "tsx" => "typescriptreact",
+        "py" | "pyi" => "python",
+        "rs" => "rust",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" => "cpp",
+        "rb" => "ruby",
+        "php" => "php",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "cs" => "csharp",
+        _ => return None,
+    })
+}
+
+/// Documents this pass handed to the server itself, closed when it is done.
+///
+/// Scoped to one entity's enrichment. Opening is lazy and each path is opened
+/// at most once, because the join reaches the same module file for every
+/// candidate export it considers and a per-candidate open would be both slower
+/// and a lifecycle the server has no reason to expect.
+///
+/// The file being enriched is never opened here. Its caller already holds that
+/// document open, and re-opening a live document is a change notification this
+/// pass has no business sending.
+struct ScopedDocuments<'a> {
+    server: &'a LspServer,
+    provider: Option<DocumentProvider<'a>>,
+    open: std::collections::HashSet<String>,
+}
+
+impl<'a> ScopedDocuments<'a> {
+    fn new(server: &'a LspServer, provider: Option<DocumentProvider<'a>>) -> Self {
+        Self {
+            server,
+            provider,
+            open: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Hand `rel_path` to the server if it is not already open, and report
+    /// whether the server now holds it.
+    async fn ensure_open(&mut self, rel_path: &str, uri: &str) -> bool {
+        if self.open.contains(uri) {
+            return true;
+        }
+        let Some(provider) = self.provider else {
+            debug!(
+                path = %rel_path,
+                "declined a cross-file query: no document provider was supplied"
+            );
+            return false;
+        };
+        let Some(language_id) = lsp_language_id(rel_path) else {
+            debug!(path = %rel_path, "declined a cross-file query: unknown language for this path");
+            return false;
+        };
+        let Some(text) = provider(rel_path) else {
+            debug!(
+                path = %rel_path,
+                "declined a cross-file query: repository authority has no text for this path"
+            );
+            return false;
+        };
+        let notified = self
+            .server
+            .client
+            .notify(
+                "textDocument/didOpen",
+                serde_json::json!({
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": language_id,
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            )
+            .await;
+        if let Err(error) = notified {
+            debug!(path = %rel_path, error = %error, "failed to open a document for a cross-file query");
+            return false;
+        }
+        debug!(path = %rel_path, "opened a graph-owned document for a cross-file query");
+        self.open.insert(uri.to_string());
+        true
+    }
+
+    /// Close every document this pass opened.
+    async fn close_all(&mut self) {
+        for uri in self.open.drain() {
+            let _ = self
+                .server
+                .client
+                .notify(
+                    "textDocument/didClose",
+                    serde_json::json!({ "textDocument": { "uri": uri } }),
+                )
+                .await;
+        }
+    }
+}
+
 /// Query type definitions for entities referenced in a function's signature/body.
 /// For each resolved type, find it in the graph index and emit UsesType relations.
+///
+/// `documents` supplies graph-owned text for files this pass needs the server
+/// to hold besides the one being enriched. It is optional: without it the
+/// member-on-module join declines rather than binding, which is the behavior
+/// this pass had before a provider existed.
 pub async fn enrich_entity_uses_type(
     server: &LspServer,
     entity: &EntityRef,
     index: &EntityIndex,
     workspace_root: &Path,
+    documents: Option<DocumentProvider<'_>>,
 ) -> Result<Vec<Relation>> {
     if !server.has_type_definition() {
         return Ok(Vec::new());
@@ -550,6 +689,7 @@ pub async fn enrich_entity_uses_type(
     // types, return types, and type references in the body.
     let mut relations = Vec::new();
     let mut seen_targets = std::collections::HashSet::new();
+    let mut scoped_documents = ScopedDocuments::new(server, documents);
 
     for line in entity.start_line..=entity.end_line {
         let Some(line_text) = lines.get(line as usize) else {
@@ -598,6 +738,23 @@ pub async fn enrich_entity_uses_type(
                             // refused. Nothing is matched on the name alone.
                             let candidate_uri =
                                 protocol::path_to_uri(&workspace_root.join(&candidate.file_path));
+                            // The export's own token lives in the module file,
+                            // which is not the file being enriched, and a server
+                            // answers only about documents it holds. The caller
+                            // opens the enriched file and nothing else, so this
+                            // second leg queried a document the server had never
+                            // seen, came back empty, and declined every join:
+                            // `Router` stayed at zero references while the
+                            // misattribution it was meant to replace was already
+                            // gone. Hand the server that document first, from
+                            // repository authority, and close it below.
+                            if candidate.file_path != entity.file_path
+                                && !scoped_documents
+                                    .ensure_open(&candidate.file_path, &candidate_uri)
+                                    .await
+                            {
+                                continue;
+                            }
                             let candidate_definitions = locations_at(
                                 server,
                                 "textDocument/definition",
@@ -734,6 +891,8 @@ pub async fn enrich_entity_uses_type(
             }
         }
     }
+
+    scoped_documents.close_all().await;
 
     Ok(relations)
 }
@@ -1069,6 +1228,90 @@ mod member_on_module_tests {
         assert!(
             !receiver_names_a_module(&[], here),
             "a receiver the server said nothing about is not promoted to a module"
+        );
+    }
+
+    /// The document this pass opens is named by its own extension. A path it
+    /// cannot classify is declined rather than opened under a guess.
+    #[test]
+    fn a_document_is_opened_under_the_language_its_extension_names() {
+        use super::lsp_language_id;
+        assert_eq!(lsp_language_id("lib/express.js"), Some("javascript"));
+        assert_eq!(lsp_language_id("src/app.mjs"), Some("javascript"));
+        assert_eq!(lsp_language_id("src/app.tsx"), Some("typescriptreact"));
+        assert_eq!(lsp_language_id("requests/sessions.py"), Some("python"));
+        assert_eq!(lsp_language_id("src/enrichment.rs"), Some("rust"));
+        assert_eq!(
+            lsp_language_id("LICENSE"),
+            None,
+            "a path with no extension names no language"
+        );
+        assert_eq!(
+            lsp_language_id("docs/readme.md"),
+            None,
+            "an extension this map does not carry is declined, never guessed"
+        );
+    }
+
+    /// A provider is what makes the second leg answerable, and its absence is
+    /// what makes the join decline. Both are the same code path, so both are
+    /// asserted against the same helper the join calls.
+    #[tokio::test]
+    async fn a_missing_provider_declines_and_a_present_one_opens() {
+        use super::{DocumentProvider, ScopedDocuments};
+
+        let server = crate::lifecycle::LspServer::offline_for_tests();
+
+        let mut without = ScopedDocuments::new(&server, None);
+        assert!(
+            !without
+                .ensure_open("lib/express.js", "file:///w/lib/express.js")
+                .await,
+            "no provider means the join keeps declining, never a disk read"
+        );
+        assert!(without.open.is_empty());
+
+        // The provider counts its calls, so "opened at most once" is observable
+        // rather than merely consistent with a set that cannot hold duplicates.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let provider: &(dyn Fn(&str) -> Option<String> + Send + Sync) = &|path: &str| {
+            asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (path == "lib/express.js").then(|| "exports.Router = Router;".to_string())
+        };
+        let mut with = ScopedDocuments::new(&server, Some(provider as DocumentProvider<'_>));
+        assert!(
+            with.ensure_open("lib/express.js", "file:///w/lib/express.js")
+                .await,
+            "a provider that answers hands the document to the server"
+        );
+        assert_eq!(with.open.len(), 1);
+        assert!(
+            with.ensure_open("lib/express.js", "file:///w/lib/express.js")
+                .await,
+            "a document already open stays open"
+        );
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the same document is opened at most once per entity"
+        );
+
+        assert!(
+            !with
+                .ensure_open("lib/other.js", "file:///w/lib/other.js")
+                .await,
+            "a path repository authority has nothing for declines"
+        );
+        assert!(
+            !with.ensure_open("NOTICE", "file:///w/NOTICE").await,
+            "a path whose language cannot be named declines"
+        );
+        assert_eq!(with.open.len(), 1);
+
+        with.close_all().await;
+        assert!(
+            with.open.is_empty(),
+            "every document this pass opened is closed with it"
         );
     }
 
