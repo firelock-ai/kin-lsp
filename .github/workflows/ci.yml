@@ -52,16 +52,19 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      - name: Cache cargo registry and build
-        uses: actions/cache@v4
+      # Restore the one small source cache owned by the default-branch seed.
+      # Build outputs are deliberately excluded: target/ made each immutable
+      # PR, merge-queue and main cache 1.7-2.5 GiB per runner OS.
+      - name: Restore cargo sources
+        id: cargo-sources
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-sources-v1
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-sources-
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -76,3 +79,9 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Check Actions cache policy
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/check-actions-cache-policy.sh
+          ./scripts/test-actions-cache-policy.sh
