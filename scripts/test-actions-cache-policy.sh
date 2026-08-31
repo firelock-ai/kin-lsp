@@ -67,6 +67,18 @@ case_root="$(make_case conditional-restore)"
 perl -0pi -e "s/(      - name: Restore cargo sources\n)/\$1        if: github.event_name == 'pull_request'\n/" "${case_root}/ci.yml"
 expect_rejection conditional-restore "${case_root}" "cache restore must run on every workflow ref"
 
+case_root="$(make_case conditional-job)"
+perl -0pi -e "s/(  check:\n)/\$1    if: github.event_name == 'workflow_dispatch'\n/" "${case_root}/ci.yml"
+expect_rejection conditional-job "${case_root}" "check job must run unconditionally"
+
+case_root="$(make_case narrowed-matrix)"
+perl -0pi -e 's/os: \[ubuntu-latest, macos-latest\]/os: [ubuntu-latest]/' "${case_root}/ci.yml"
+expect_rejection narrowed-matrix "${case_root}" "exact Linux/macOS matrix"
+
+case_root="$(make_case narrowed-trigger)"
+perl -0pi -e 's/  merge_group:\n//' "${case_root}/ci.yml"
+expect_rejection narrowed-trigger "${case_root}" "must run exactly on pull requests to main and merge groups"
+
 case_root="$(make_case late-restore)"
 perl -0pi -e 's#(      - name: Restore cargo sources\n)#      - name: Cargo work before restore\n        run: cargo fetch\n\n$1#' "${case_root}/ci.yml"
 expect_rejection late-restore "${case_root}" "cache restore must precede every run step"
@@ -90,5 +102,9 @@ expect_rejection composite-cache-action "${case_root}" "repo-local composite act
 case_root="$(make_case unexpected-workflow)"
 cp "${case_root}/ci.yml" "${case_root}/shadow.yml"
 expect_rejection unexpected-workflow "${case_root}" "shadow.yml: unexpected cache action"
+
+case_root="$(make_case reusable-pin-drift)"
+perl -0pi -e 's/cargo-registry-release\.yml\@v0\.1\.32/cargo-registry-release.yml\@v0.1.99/' "${case_root}/registry-publish.yml"
+expect_rejection reusable-pin-drift "${case_root}" "until its external cache behavior is re-audited"
 
 echo "OK: all Actions cache policy falsifiers were rejected."

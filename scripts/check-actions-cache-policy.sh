@@ -20,6 +20,14 @@ expected_counts = {
   "ci.yml" => [1, 0],
   "cache-seed.yml" => [1, 1],
 }.freeze
+expected_job_uses = {
+  ["kin-dependency-wave.yml", "dependency-wave"] =>
+    "firelock-ai/kin-actions/.github/workflows/cargo-dependency-wave.yml@v0.1.32",
+  ["merge-queue-ejection-notice.yml", "notice"] =>
+    "firelock-ai/kin-actions/.github/workflows/merge-queue-ejection-notice.yml@v0.1.31",
+  ["registry-publish.yml", "release"] =>
+    "firelock-ai/kin-actions/.github/workflows/cargo-registry-release.yml@v0.1.32",
+}.freeze
 allowed_paths = ["~/.cargo/registry", "~/.cargo/git"].freeze
 restore_key = "${{ runner.os }}-cargo-sources-v1"
 restore_prefix = "${{ runner.os }}-cargo-sources-"
@@ -29,6 +37,7 @@ save_condition = "github.ref == 'refs/heads/main' && steps.cargo-sources.outputs
 errors = []
 counts = {}
 documents = {}
+job_uses = {}
 workflows = Dir[File.join(workflow_root, "*.{yml,yaml}")].sort
 abort("FAIL: no workflow files found under #{workflow_root}") if workflows.empty?
 
@@ -110,6 +119,10 @@ workflows.each do |workflow|
 
   jobs.each do |job_name, job|
     next unless job.is_a?(Hash)
+
+    if job["uses"].is_a?(String)
+      job_uses[[file_name, job_name]] = job["uses"]
+    end
 
     steps = job["steps"]
     next if steps.nil?
@@ -235,12 +248,58 @@ counts.each do |workflow_name, actual|
   errors << "#{workflow_name}: unexpected cache action; add it to the bounded policy deliberately"
 end
 
+expected_job_uses.each do |location, expected|
+  actual = job_uses[location]
+  next if actual == expected
+
+  errors << (
+    "#{location[0]}: job #{location[1].inspect} reusable workflow pin must remain " \
+    "#{expected.inspect} until its external cache behavior is re-audited; found #{actual.inspect}"
+  )
+end
+
+job_uses.each_key do |location|
+  next if expected_job_uses.key?(location)
+
+  errors << (
+    "#{location[0]}: job #{location[1].inspect} introduces an unaudited reusable workflow; " \
+    "register its cache behavior deliberately"
+  )
+end
+
+
+ci = documents["ci.yml"]
+ci_events = ci.is_a?(Hash) ? (ci["on"] || ci[true]) : nil
+ci_pull_request = ci_events.is_a?(Hash) ? ci_events["pull_request"] : nil
+unless ci_events.is_a?(Hash) && ci_events.keys == ["pull_request", "merge_group"] &&
+       ci_pull_request.is_a?(Hash) && ci_pull_request["branches"] == ["main"] &&
+       ci_events["merge_group"].nil?
+  errors << "ci.yml: cache-consuming CI must run exactly on pull requests to main and merge groups"
+end
+
+ci_check = ci.is_a?(Hash) ? ci.dig("jobs", "check") : nil
+ci_matrix = ci_check.is_a?(Hash) ? ci_check.dig("strategy", "matrix") : nil
+unless ci_check.is_a?(Hash) && !ci_check.key?("if") &&
+       ci_check["runs-on"] == "${{ matrix.os }}" && ci_matrix.is_a?(Hash) &&
+       ci_matrix.keys == ["os"] && ci_matrix["os"] == ["ubuntu-latest", "macos-latest"]
+  errors << "ci.yml: cache-consuming check job must run unconditionally on the exact Linux/macOS matrix"
+end
+
 seed = documents["cache-seed.yml"]
 seed_events = seed.is_a?(Hash) ? (seed["on"] || seed[true]) : nil
 seed_push = seed_events.is_a?(Hash) ? seed_events["push"] : nil
 unless seed_events.is_a?(Hash) && seed_events.keys == ["push"] &&
        seed_push.is_a?(Hash) && seed_push["branches"] == ["main"]
   errors << "cache-seed.yml: cache writer workflow must trigger only on pushes to main"
+end
+
+
+seed_job = seed.is_a?(Hash) ? seed.dig("jobs", "seed") : nil
+seed_matrix = seed_job.is_a?(Hash) ? seed_job.dig("strategy", "matrix") : nil
+unless seed_job.is_a?(Hash) && !seed_job.key?("if") &&
+       seed_job["runs-on"] == "${{ matrix.os }}" && seed_matrix.is_a?(Hash) &&
+       seed_matrix.keys == ["os"] && seed_matrix["os"] == ["ubuntu-latest", "macos-latest"]
+  errors << "cache-seed.yml: cache writer job must run unconditionally on the exact Linux/macOS matrix"
 end
 
 unless errors.empty?
@@ -250,7 +309,8 @@ unless errors.empty?
 end
 
 puts(
-  "OK: repo-local Actions caches are source-only, epoch-bounded, restored on every ref, " \
-  "and saved only by pushes to main (2 restores, 1 save)."
+  "OK: direct cache steps are source-only, epoch-bounded, restored on every CI ref, and " \
+  "saved only by pushes to main (2 restores, 1 save); external reusable workflows remain " \
+  "bound to the exact audited pins listed in this policy."
 )
 RUBY
