@@ -65,16 +65,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-sources-
 
-      # Dependencies and workspace libraries only. `--all-targets` is left off
-      # on purpose, so test and bench targets are not compiled and nothing is
-      # run. RUSTFLAGS above matches `ci.yml` because cargo fingerprints every
-      # unit on it, and a seed built under different flags fills the cache with
-      # artifacts CI would rebuild anyway.
-      - name: Warm the dependency build
-        continue-on-error: true
-        run: |
-          cargo fetch
-          cargo build
+      # Fetch must succeed before the explicit save. Build output is not cached,
+      # so compiling here would consume runner time without warming CI.
+      - name: Fetch Cargo dependencies
+        run: cargo fetch
 
       - name: Save cargo sources on main
         if: github.ref == 'refs/heads/main' && steps.cargo-sources.outputs.cache-hit != 'true'

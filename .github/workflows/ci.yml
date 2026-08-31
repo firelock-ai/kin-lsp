@@ -66,6 +66,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-sources-
 
+      # This step is intentionally unconditional. The policy script binds its
+      # own location and exact command, while the exact OS matrix above means a
+      # policy check runs on every CI ref even if one platform later fails.
+      - name: Check Actions cache policy
+        run: |
+          ./scripts/check-actions-cache-policy.sh
+          ./scripts/test-actions-cache-policy.sh
+
       - name: Check formatting
         run: cargo fmt -- --check
 
@@ -79,9 +87,3 @@ jobs:
 
       - name: Test
         run: cargo test
-
-      - name: Check Actions cache policy
-        if: runner.os == 'Linux'
-        run: |
-          ./scripts/check-actions-cache-policy.sh
-          ./scripts/test-actions-cache-policy.sh
