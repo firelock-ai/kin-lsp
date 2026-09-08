@@ -222,6 +222,35 @@ impl LspServer {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn scripted_for_tests(script: &str, responses: serde_json::Value) -> Self {
+        let mut child = Command::new("python3")
+            .args(["-u", "-c", script])
+            .env("KIN_LSP_TEST_RESPONSES", responses.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the scripted JSON-RPC peer");
+        let stdin = child.stdin.take().expect("captured stdin");
+        let stdout = child.stdout.take().expect("captured stdout");
+        let stderr = child.stderr.take().expect("captured stderr");
+        Self {
+            client: JsonRpcClient::new(stdin, stdout),
+            capabilities: serde_json::from_value(serde_json::json!({
+                "callHierarchyProvider": true,
+                "typeHierarchyProvider": true,
+                "typeDefinitionProvider": true,
+                "definitionProvider": true,
+                "referencesProvider": true,
+            }))
+            .unwrap(),
+            child,
+            stderr_tail: drain_stderr(stderr),
+        }
+    }
+
     /// Send shutdown request and exit notification.
     pub async fn shutdown(self) -> Result<()> {
         let _ = self
@@ -236,27 +265,42 @@ impl LspServer {
 
     /// Check if the server supports call hierarchy.
     pub fn has_call_hierarchy(&self) -> bool {
-        self.capabilities.call_hierarchy_provider.is_some()
+        matches!(
+            self.capabilities.call_hierarchy_provider.as_ref(),
+            Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+        )
     }
 
     /// Check if the server supports go-to-definition.
     pub fn has_definition(&self) -> bool {
-        self.capabilities.definition_provider.is_some()
+        matches!(
+            self.capabilities.definition_provider.as_ref(),
+            Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+        )
     }
 
     /// Check if the server supports find references.
     pub fn has_references(&self) -> bool {
-        self.capabilities.references_provider.is_some()
+        matches!(
+            self.capabilities.references_provider.as_ref(),
+            Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+        )
     }
 
     /// Check if the server supports type hierarchy.
     pub fn has_type_hierarchy(&self) -> bool {
-        self.capabilities.type_hierarchy_provider.is_some()
+        matches!(
+            self.capabilities.type_hierarchy_provider.as_ref(),
+            Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+        )
     }
 
     /// Check if the server supports go-to-type-definition.
     pub fn has_type_definition(&self) -> bool {
-        self.capabilities.type_definition_provider.is_some()
+        matches!(
+            self.capabilities.type_definition_provider.as_ref(),
+            Some(serde_json::Value::Bool(true) | serde_json::Value::Object(_))
+        )
     }
 
     /// The capabilities this live server reported during the initialize
