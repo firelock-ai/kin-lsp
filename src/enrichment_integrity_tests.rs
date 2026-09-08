@@ -668,3 +668,37 @@ async fn member_queries_respect_independently_disabled_capabilities() {
         assert!(!requests.is_empty(), "supported queries must still run");
     }
 }
+
+#[tokio::test]
+async fn failed_drop_cleanup_invalidates_later_barriers() {
+    let f = Fixture::new(None);
+    let server = LspServer::scripted_for_tests(PEER, f.responses());
+    let provider = |_: &str| Some("Widget".into());
+    let mut documents = enrichment::ScopedDocuments::new(&server, Some(&provider));
+    let uri = crate::protocol::path_to_uri(&f.root.join("types.py"));
+    assert!(documents.ensure_open("types.py", &uri).await.unwrap());
+    // The peer closes its read end before acknowledging, but keeps stdout
+    // alive, so the cleanup write itself must detect the broken pipe.
+    assert_eq!(
+        server
+            .client
+            .request("test/close-input", Value::Null)
+            .await
+            .unwrap(),
+        json!(true)
+    );
+    drop(documents);
+    let barrier = match server.client.close_documents(Vec::new()) {
+        Ok(done) => done.await.unwrap_or(Err(LspError::ServerDied)),
+        Err(error) => Err(error),
+    };
+    assert!(
+        barrier.is_err(),
+        "failed unobserved cleanup must poison a later barrier"
+    );
+    assert!(server
+        .client
+        .request("test/seen", Value::Null)
+        .await
+        .is_err());
+}
